@@ -1,0 +1,33 @@
+# User-provided proprietary inputs are never part of the public source tree.
+/docker_compose_files/*
+!/docker_compose_files/.gitkeep
+/docker_img_files/*
+!/docker_img_files/.gitkeep
+/patch_core/*
+!/patch_core/.gitkeep
+
+# Generated state, secrets, backups and local environments.
+.kars/
+credentials.json
+deployment.json
+prepared.json
+config-*/
+legacy_backup*/
+*.sql
+*.archive
+*.tar
+*.tar.gz
+*.zip
+*.pem
+*.key
+id_rsa*
+.env
+.env.*
+!.env.example
+*.log
+*.bak*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
