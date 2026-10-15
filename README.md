@@ -3,7 +3,7 @@
 
 [English](README.md) | [繁體中文](README_ZH.md)
 
-My first GitHub project: cross-platform deployment tooling for EV services, with Compose configuration preparation and per-install credentials. This repository contains the automation, not a complete runnable service, third-party images, or site data.
+EV-service deployment tooling. Cross-platform launchers, Compose preparation, per-install credentials. Bring your own service assets.
 
 ## 🚀 Key Features
 - **Cross-Platform**: Support for Linux, macOS, and Windows.
