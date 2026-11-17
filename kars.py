@@ -85,13 +85,16 @@ def unique_mapping(loader, node, deep=False):
 UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
 
-def checked_run(command, *, step=None, hint=None, env=None, **kwargs):
+def checked_run(command, *, step=None, hint=None, reveal=False, env=None, **kwargs):
     result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, **kwargs)
     if result.returncode:
         # Native diagnostics may echo rendered secrets. Do not include them;
-        # name the step so it can be repeated by hand.
+        # name the step so it can be repeated by hand. `reveal` is for the
+        # few commands that are never handed a secret.
         what = step or Path(str(command[0])).name
+        if reveal:
+            hint = " ".join(result.stderr.decode("utf-8", "replace").split())[:400] or hint
         raise KarsError(f"{what} failed (exit {result.returncode}); no success reported"
                         + (f". {hint}" if hint else ""))
     return result
@@ -108,19 +111,21 @@ def secure_directory(path: Path):
     elif os.name == "nt":
         # Set a private inheritable ACL. No admin requirement or shell quoting
         # of user paths: the static PowerShell program reads an environment value.
+        # .NET calls only, no cmdlets: started from PowerShell 7, Windows
+        # PowerShell inherits a module path it cannot load its own modules from.
         script = """
 $ErrorActionPreference = 'Stop'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl = New-Object System.Security.AccessControl.DirectorySecurity
+$acl = [System.Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner($sid)
 $acl.SetAccessRuleProtection($true, $false)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $env:KARS_ACL_PATH -AclObject $acl
+$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+[System.IO.Directory]::SetAccessControl($env:KARS_ACL_PATH, $acl)
 """
         env = dict(os.environ, KARS_ACL_PATH=str(path))
         checked_run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                     base64.b64encode(script.encode("utf-16le")).decode()], env=env)
+                     base64.b64encode(script.encode("utf-16le")).decode()], env=env,
+                    step="Restricting the data directory to this user", reveal=True)
 
 
 def private_write(path: Path, text: str):
