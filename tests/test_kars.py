@@ -390,6 +390,14 @@ class FakeDockerTests(Fixture):
         code, _, err = self.run_main("deploy")       # the stand-in lists kars-gateway and kars-core as active
         self.assertEqual(code, 0, err)
 
+    def test_zero_replica_service_is_not_preflighted(self):
+        path = self.repo / "docker_compose_files/kars-core/docker-compose.yml"
+        for disabled in ("    scale: 0\n", "    deploy:\n      replicas: 0\n"):
+            path.write_text(path.read_text().replace("- ./data:/var/lib/app", "- ~/.kars/kars-core/absent:/absent")
+                            .replace("    scale: 0\n", "") + disabled)
+            code, _, err = self.run_main("deploy")
+            self.assertEqual(code, 0, err)
+
     def test_failed_step_is_named_and_native_output_withheld(self):
         (self.fake / "up-fails").touch()
         code, out, err = self.run_main("deploy")

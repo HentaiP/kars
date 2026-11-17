@@ -464,13 +464,15 @@ def validate_configs(docker, root, manifest):
 def missing_bind_sources(root, manifest, active):
     """Bind sources that do not exist. create_host_path=false makes Compose
     refuse them anyway; this names them, which Compose's withheld output cannot.
-    Services Compose would not start (an inactive profile) are left alone."""
+    Services Compose would not start (inactive profile, zero replicas) are left alone."""
     missing = []
     for project in manifest["projects"]:
         compose = root / project["file"]
         document = yaml.safe_load(compose.read_text(encoding="utf-8"))
         for name, service in document["services"].items():
-            if name not in active.get(project["bundle"], ()):
+            replicas = service.get("deploy")
+            replicas = replicas.get("replicas") if isinstance(replicas, dict) else None
+            if name not in active.get(project["bundle"], ()) or service.get("scale") == 0 or replicas == 0:
                 continue
             for volume in service.get("volumes") or []:
                 if not isinstance(volume, dict) or volume.get("type") != "bind":
