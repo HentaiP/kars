@@ -1,5 +1,5 @@
 # Kars EV Ultimate V1.0 (Beta)
-### Powered by HentaiP feat. ClawMoew
+### Powered by HentaiP feat. ClawMoew & Maha
 
 [English](README.md) | [繁體中文](README_ZH.md)
 
@@ -69,4 +69,4 @@ python -m pip install -r requirements.txt
 - 授權見 [GPLv3](LICENSE)。第三方資產依其原始授權另行取得。
 
 ---
-**Powered by HentaiP feat. ClawMoew**
+**Powered by HentaiP feat. ClawMoew & Maha**

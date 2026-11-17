@@ -1,5 +1,5 @@
 @echo off
-:: Powered by HentaiP feat. ClawMoew
+:: Powered by HentaiP feat. ClawMoew & Maha
 setlocal
 cd /d "%~dp0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_windows.ps1" %*

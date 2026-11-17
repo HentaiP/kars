@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Powered by HentaiP feat. ClawMoew
+# Powered by HentaiP feat. ClawMoew & Maha
 # Stop only the projects in this deployment manifest; no global prune.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

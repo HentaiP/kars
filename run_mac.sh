@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kars EV Ultimate — macOS
-# Powered by HentaiP feat. ClawMoew.
+# Powered by HentaiP feat. ClawMoew & Maha.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${KARS_PYTHON:-}"

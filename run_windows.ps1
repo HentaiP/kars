@@ -1,4 +1,4 @@
-# Powered by HentaiP feat. ClawMoew.
+# Powered by HentaiP feat. ClawMoew & Maha.
 $ErrorActionPreference = "Stop"
 try {
     $script = Join-Path $PSScriptRoot "kars.py"

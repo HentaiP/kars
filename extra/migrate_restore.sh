@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Powered by HentaiP feat. ClawMoew
+# Powered by HentaiP feat. ClawMoew & Maha
 # Read-only restore plan by default. Never overwrite hardened appsettings/nginx.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

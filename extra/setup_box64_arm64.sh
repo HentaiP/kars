@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Powered by HentaiP feat. ClawMoew
+# Powered by HentaiP feat. ClawMoew & Maha
 # Read-only architecture check. Box64 installation alone does not make Docker
 # run amd64 containers, so do not register conflicting global binfmt handlers.
 set -euo pipefail

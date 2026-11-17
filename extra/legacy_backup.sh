@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kars legacy backup. Credentials never appear in mysqldump's command line.
-# Powered by HentaiP feat. ClawMoew.
+# Powered by HentaiP feat. ClawMoew & Maha.
 set -euo pipefail
 umask 077
 BACKUP_DIR=$(mktemp -d "${1:-./legacy_backup_$(date +%Y%m%d_%H%M%S)}.XXXXXX")

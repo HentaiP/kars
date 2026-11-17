@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kars deployment preparation; user-supplied assets, no privileged installation.
 
-Powered by HentaiP feat. ClawMoew.
+Powered by HentaiP feat. ClawMoew & Maha.
 SPDX-License-Identifier: GPL-3.0-only
 """
 from __future__ import annotations
