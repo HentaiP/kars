@@ -11,6 +11,7 @@
 credentials.json
 deployment.json
 prepared.json
+images.json
 config-*/
 legacy_backup*/
 *.sql

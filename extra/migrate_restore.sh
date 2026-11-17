@@ -31,7 +31,12 @@ fi
 DATA_ROOT="${KARS_DATA_ROOT:-$HOME/.kars}"
 MONGO_CONTAINER="${KARS_MONGO_CONTAINER:-kars-mongodb}"
 PROJECT=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$MONGO_CONTAINER")
-"${KARS_PYTHON:-python3}" - "$SCRIPT_DIR/.." "$DATA_ROOT" "$PROJECT" <<'PY'
+PYTHON="${KARS_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    PYTHON="$SCRIPT_DIR/../.venv/bin/python"
+    [ -x "$PYTHON" ] || PYTHON=python3
+fi
+"$PYTHON" - "$SCRIPT_DIR/.." "$DATA_ROOT" "$PROJECT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])

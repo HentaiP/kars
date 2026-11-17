@@ -3,4 +3,9 @@
 # Stop only the projects in this deployment manifest; no global prune.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${KARS_PYTHON:-python3}" "$SCRIPT_DIR/../kars.py" cleanup "$@"
+PYTHON="${KARS_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    PYTHON="$SCRIPT_DIR/../.venv/bin/python"
+    [ -x "$PYTHON" ] || PYTHON=python3
+fi
+exec "$PYTHON" "$SCRIPT_DIR/../kars.py" cleanup "$@"

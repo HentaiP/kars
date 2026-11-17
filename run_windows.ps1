@@ -2,8 +2,12 @@
 $ErrorActionPreference = "Stop"
 try {
     $script = Join-Path $PSScriptRoot "kars.py"
+    # The virtual environment from the README, if it was created here.
+    $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
     if ($env:KARS_PYTHON) {
         & $env:KARS_PYTHON $script @args
+    } elseif (Test-Path -LiteralPath $venv) {
+        & $venv $script @args
     } elseif (Get-Command python -ErrorAction SilentlyContinue) {
         & python $script @args
     } elseif (Get-Command py -ErrorAction SilentlyContinue) {

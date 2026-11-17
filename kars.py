@@ -22,6 +22,9 @@ import sys
 import tempfile
 import uuid
 
+if sys.version_info < (3, 10):
+    raise SystemExit("Kars requires Python 3.10 or newer")
+
 try:
     import yaml
     from cryptography.exceptions import UnsupportedAlgorithm
@@ -31,6 +34,8 @@ except ImportError:
     raise SystemExit("Install the requirements in a virtual environment: python -m pip install -r requirements.txt")
 
 BUNDLES = ("kars", "kars-gateway", "kars-core", "kars-connector")
+ACTIONS = ("check", "prepare", "deploy", "status", "cleanup")
+DAEMON_HINT = "Start Docker and make sure this user can reach it"
 SSO_TARGET = "/internal/api/routes/auth.js"
 SSO_PATCH = """'use strict';
 const express = require('express');
@@ -80,12 +85,15 @@ def unique_mapping(loader, node, deep=False):
 UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
 
-def checked_run(command, *, env=None, **kwargs):
+def checked_run(command, *, step=None, hint=None, env=None, **kwargs):
     result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, **kwargs)
     if result.returncode:
-        # Native diagnostics may echo rendered secrets. Do not include them.
-        raise KarsError(f"{Path(str(command[0])).name} failed (exit {result.returncode}); no success reported")
+        # Native diagnostics may echo rendered secrets. Do not include them;
+        # name the step so it can be repeated by hand.
+        what = step or Path(str(command[0])).name
+        raise KarsError(f"{what} failed (exit {result.returncode}); no success reported"
+                        + (f". {hint}" if hint else ""))
     return result
 
 
@@ -135,16 +143,24 @@ def private_write(path: Path, text: str):
 def deployment_lock(root: Path):
     secure_directory(root)
     lock = root / ".deployment.lock"
+    if lock.is_symlink():
+        raise KarsError("Managed file must not be a symlink")
+    # The operating system holds the lock and drops it when this process ends,
+    # however it ends. The file stays behind and means nothing by itself.
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise KarsError("Another deployment holds the lock. If it crashed, verify no run is active before removing .deployment.lock")
-    try:
-        with os.fdopen(fd, "w") as stream:
-            stream.write(str(os.getpid()))
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise KarsError("Another Kars run is using this data directory; wait for it to finish")
         yield
     finally:
-        lock.unlink()
+        os.close(fd)
 
 
 def inputs(repo: Path):
@@ -236,6 +252,18 @@ def compose_path(path: Path) -> str:
     return text.replace("$", "$$")
 
 
+def host_path(text: str, base: Path):
+    """Host path a rendered bind source names; None if only Compose can tell."""
+    text = text.replace("$$", "\0")
+    if "$" in text:
+        return None  # user-authored ${VARIABLE}
+    text = text.replace("\0", "$")
+    if os.name == "nt" and re.match(r"^/[A-Za-z](/|$)", text):
+        text = text[1] + ":" + text[2:]
+    path = Path(text).expanduser()
+    return path if path.is_absolute() else base / path
+
+
 def private_dir(path: Path):
     if path.is_symlink():
         raise KarsError("Refusing to create a directory through a symlink")
@@ -260,28 +288,101 @@ def volume_parts(volume):
     return {"type": "bind", "source": source, "target": target, "read_only": mode == "ro"}
 
 
+def harden_environment(service, keys):
+    """Per-install RSA keys take the place of whatever the template carried."""
+    environment = service.get("environment", {})
+    if isinstance(environment, list):
+        environment = [entry.split("=", 1)[0] + "=" + keys[entry.split("=", 1)[0]]
+                       if isinstance(entry, str) and entry.split("=", 1)[0] in keys else entry
+                       for entry in environment]
+    elif isinstance(environment, dict):
+        environment = {k: keys.get(k, v) for k, v in environment.items()}
+    else:
+        raise KarsError("Environment must be a mapping or list")
+    if "environment" in service:
+        service["environment"] = environment
+
+
+def pin_bind(volume, *, source, destination, data, redirects):
+    """Give one bind mount an explicit host source that Docker may not create."""
+    mount_source = volume.get("source", "")
+    if not isinstance(mount_source, str) or not mount_source:
+        raise KarsError("Bind mounts require an explicit source")
+    if os.name == "nt" and re.match(r"^[A-Za-z]:[/\\]", mount_source):
+        volume["source"] = mount_source = compose_path(Path(mount_source))
+    if mount_source.startswith("./"):
+        relative = Path(mount_source[2:])
+        if ".." in relative.parts:
+            raise KarsError("Relative bind mounts must stay within their bundle")
+        if (source / relative).is_file():
+            resolved = destination / relative
+        else:
+            resolved = data / relative
+            if resolved.is_symlink() or (resolved.exists() and not resolved.is_dir()):
+                raise KarsError("Relative directory mount is not an ordinary directory")
+            private_dir(resolved)
+        volume["source"] = compose_path(resolved)
+    elif mount_source.startswith("../"):
+        raise KarsError("Use explicit absolute paths instead of parent-relative bind mounts")
+    if volume["source"] in redirects:
+        volume["source"] = compose_path(redirects[volume["source"]])
+    volume.setdefault("bind", {})["create_host_path"] = False
+
+
+def external_networks(document):
+    """Names of the external networks a bundle expects to find.
+
+    Templates written for Compose v1 spell these `external: {name: ...}`;
+    that is rewritten to the current `external: true` plus `name`.
+    """
+    names = set()
+    for key, network in (document.get("networks") or {}).items():
+        if not isinstance(network, dict):
+            continue
+        external = network.get("external")
+        if isinstance(external, dict):
+            legacy = external.get("name", key)
+            if network.setdefault("name", legacy) != legacy:
+                raise KarsError("External network is named twice with different names")
+            network["external"] = external = True
+        if external is True:
+            netname = network.get("name", key)
+            if not isinstance(netname, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", netname):
+                raise KarsError("External networks need a concrete name, not an interpolated expression")
+            names.add(netname)
+    return names
+
+
 def prepare(repo: Path, root: Path, documents: dict, creds: dict):
     """Create a new immutable configuration generation, not a live installation.
 
-    Caller holds deployment_lock. Existing data and earlier configurations stay.
+    Caller holds deployment_lock. Existing data stays; prune_generations
+    removes superseded generations once a run has succeeded.
     """
     generation = root / ("config-" + uuid.uuid4().hex)
     private_dir(generation)
-    patch = generation / "patch_core/routes/auth_v5.js"
-    private_write(patch, SSO_PATCH)
-    nginx = generation / "nginx/default.conf"
-    private_write(nginx, NGINX)
-    user = re.sub(r"[^A-Za-z0-9_]", "", getpass.getuser()) or "kars_user"
-    # Escape literal dollars inserted into Compose strings, not user-authored
-    # ${VARIABLE} expressions; Compose will restore a literal dollar at runtime.
-    replacements = {"DEFAULT_SECURE_PASS_A": creds["db"], "DEFAULT_SECURE_PASS_B": creds["api"],
-                    "BOOTSTRAP_KEY_PLACEHOLDER": creds["jwt"], "universal-user": user,
-                    "$HOME/.kars": compose_path(root), "${HOME}/.kars": compose_path(root),
-                    "~/.kars": compose_path(root), "./patch_core": compose_path(generation / "patch_core")}
-    keys = {"AUTH_RSA_PRIVATE": base64.b64encode(creds["private_pem"].encode()).decode(),
-            "AUTH_RSA_PUBLIC": base64.b64encode(creds["public_pem"].encode()).decode()}
-    manifests, networks = [], set()
     try:
+        patch = generation / "patch_core/routes/auth_v5.js"
+        private_write(patch, SSO_PATCH)
+        nginx = generation / "nginx/default.conf"
+        private_write(nginx, NGINX)
+        user = re.sub(r"[^A-Za-z0-9_]", "", getpass.getuser()) or "kars_user"
+        # Escape literal dollars inserted into Compose strings, not user-authored
+        # ${VARIABLE} expressions; Compose will restore a literal dollar at runtime.
+        replacements = {"DEFAULT_SECURE_PASS_A": creds["db"], "DEFAULT_SECURE_PASS_B": creds["api"],
+                        "BOOTSTRAP_KEY_PLACEHOLDER": creds["jwt"], "universal-user": user,
+                        "$HOME/.kars": compose_path(root), "${HOME}/.kars": compose_path(root),
+                        "~/.kars": compose_path(root), "./patch_core": compose_path(generation / "patch_core")}
+        keys = {"AUTH_RSA_PRIVATE": base64.b64encode(creds["private_pem"].encode()).decode(),
+                "AUTH_RSA_PUBLIC": base64.b64encode(creds["public_pem"].encode()).decode()}
+        redirects = {
+            compose_path(root / "kars-core/appsettings.json"): generation / "kars-core/appsettings.json",
+            compose_path(root / "kars/data/nginx/conf.d"): nginx.parent,
+            compose_path(root / "kars/data/nginx/conf.d/default.conf"): nginx,
+        }
+        sso_mount = {"type": "bind", "source": compose_path(patch), "target": SSO_TARGET,
+                     "read_only": True, "bind": {"create_host_path": False}}
+        manifests, networks = [], set()
         for bundle, template in documents.items():
             source = repo / "docker_compose_files" / bundle
             destination = generation / bundle
@@ -293,81 +394,40 @@ def prepare(repo: Path, root: Path, documents: dict, creds: dict):
                     shutil.copyfile(item, target)
                     if os.name == "posix":
                         target.chmod(0o600)
-            settings = destination / "appsettings.json"
             if bundle == "kars-core":
+                settings = destination / "appsettings.json"
                 data = replace_values(json.loads(settings.read_text(encoding="utf-8-sig")),
                                       {"BOOTSTRAP_KEY_PLACEHOLDER": creds["jwt"]}, settings=True)
                 private_write(settings, json.dumps(data, indent=2) + "\n")
             document = replace_values(template, replacements)
             for name, service in document["services"].items():
-                environment = service.get("environment", {})
-                if isinstance(environment, list):
-                    environment = [entry.split("=", 1)[0] + "=" + keys[entry.split("=", 1)[0]]
-                                   if isinstance(entry, str) and entry.split("=", 1)[0] in keys else entry
-                                   for entry in environment]
-                elif isinstance(environment, dict):
-                    environment = {k: keys.get(k, v) for k, v in environment.items()}
-                else:
-                    raise KarsError("Environment must be a mapping or list")
-                if "environment" in service:
-                    service["environment"] = environment
+                harden_environment(service, keys)
                 volumes = []
-                for value in service.get("volumes", []):
+                for value in service.get("volumes") or []:
                     volume = volume_parts(value)
                     if isinstance(volume, dict) and volume.get("type") == "bind":
-                        mount_source = volume.get("source", "")
-                        if not isinstance(mount_source, str) or not mount_source:
-                            raise KarsError("Bind mounts require an explicit source")
-                        if os.name == "nt" and re.match(r"^[A-Za-z]:[/\\]", mount_source):
-                            volume["source"] = compose_path(Path(mount_source))
-                            mount_source = volume["source"]
-                        if mount_source.startswith("./"):
-                            relative = Path(mount_source[2:])
-                            if ".." in relative.parts:
-                                raise KarsError("Relative bind mounts must stay within their bundle")
-                            if (source / relative).is_file():
-                                resolved = destination / relative
-                            else:
-                                resolved = root / bundle / relative
-                                if resolved.is_symlink() or (resolved.exists() and not resolved.is_dir()):
-                                    raise KarsError("Relative directory mount is not an ordinary directory")
-                                private_dir(resolved)
-                            volume["source"] = compose_path(resolved)
-                        elif mount_source.startswith("../"):
-                            raise KarsError("Use explicit absolute paths instead of parent-relative bind mounts")
-                        redirects = {
-                            compose_path(root / "kars-core/appsettings.json"): generation / "kars-core/appsettings.json",
-                            compose_path(root / "kars/data/nginx/conf.d"): nginx.parent,
-                            compose_path(root / "kars/data/nginx/conf.d/default.conf"): nginx,
-                        }
-                        if volume["source"] in redirects:
-                            volume["source"] = compose_path(redirects[volume["source"]])
-                        volume.setdefault("bind", {})["create_host_path"] = False
+                        pin_bind(volume, source=source, destination=destination,
+                                 data=root / bundle, redirects=redirects)
                     if name == "kars-gateway" and isinstance(volume, dict) and volume.get("target") == SSO_TARGET:
                         continue
                     volumes.append(volume)
                 if name == "kars-gateway":
-                    volumes.append({"type": "bind", "source": compose_path(patch), "target": SSO_TARGET,
-                                    "read_only": True, "bind": {"create_host_path": False}})
+                    volumes.append(dict(sso_mount, bind=dict(sso_mount["bind"])))
                 if volumes or "volumes" in service:
                     service["volumes"] = volumes
+            networks |= external_networks(document)
             rendered = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
             if any(token in rendered for token in ("-REPLACE_ME", "DEFAULT_SECURE_PASS_", "BOOTSTRAP_KEY_PLACEHOLDER")):
                 raise KarsError(f"{bundle}: unresolved credential placeholders")
             compose = destination / "docker-compose.yml"
             private_write(compose, rendered)
-            for key, network in (document.get("networks") or {}).items():
-                if isinstance(network, dict) and network.get("external") is True:
-                    netname = network.get("name", key)
-                    if not isinstance(netname, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", netname):
-                        raise KarsError("External networks need a concrete name, not an interpolated expression")
-                    networks.add(netname)
             manifests.append({"bundle": bundle, "project": f"kars-{creds['instance']}-{bundle}",
                               "file": compose.relative_to(root).as_posix(),
                               "sha256": hashlib.sha256(compose.read_bytes()).hexdigest()})
         return {"schema": 1, "instance": creds["instance"], "projects": manifests, "networks": sorted(networks)}
-    except Exception:
-        shutil.rmtree(generation)
+    except BaseException:
+        # Includes Ctrl-C: a half-written generation holds credentials too.
+        shutil.rmtree(generation, ignore_errors=True)
         raise
 
 
@@ -375,7 +435,8 @@ def docker_command():
     docker = shutil.which("docker")
     if not docker:
         raise KarsError("Install Docker with Compose v2+ yourself before deploying")
-    checked_run([docker, "compose", "version"])
+    checked_run([docker, "compose", "version"], step="docker compose version",
+                hint="Compose v2 or newer is required")
     return docker
 
 
@@ -387,11 +448,117 @@ def compose_command(docker, root, project):
 
 def validate_configs(docker, root, manifest):
     for project in manifest["projects"]:
-        checked_run(compose_command(docker, root, project) + ["config", "--quiet"])
+        checked_run(compose_command(docker, root, project) + ["config", "--quiet"],
+                    step=f"docker compose config ({project['bundle']})")
+
+
+def missing_bind_sources(root, manifest):
+    """Bind sources that do not exist. create_host_path=false makes Compose
+    refuse them anyway; this names them, which Compose's withheld output cannot."""
+    missing = []
+    for project in manifest["projects"]:
+        compose = root / project["file"]
+        document = yaml.safe_load(compose.read_text(encoding="utf-8"))
+        for service in document["services"].values():
+            for volume in service.get("volumes") or []:
+                if not isinstance(volume, dict) or volume.get("type") != "bind":
+                    continue
+                path = host_path(volume["source"], compose.parent)
+                if path is not None and not path.exists():
+                    missing.append(f"{project['bundle']}: {path}")
+    return missing
+
+
+def image_id(docker, reference):
+    found = subprocess.run([docker, "image", "inspect", "--format", "{{.Id}}", reference],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return found.stdout.decode("ascii", "replace").strip() if found.returncode == 0 else None
+
+
+def load_images(docker, repo, root):
+    """Load the supplied archives, except those whose images are still present.
+
+    images.json remembers what each archive produced. An archive is skipped
+    only if its size and timestamp are unchanged and every image it produced
+    still resolves to the same ID; anything else loads it again.
+    """
+    record = root / "images.json"
+    try:
+        seen = json.loads(record.read_text(encoding="utf-8")) if not record.is_symlink() else {}
+    except (OSError, ValueError):
+        seen = {}
+    current = {}
+    for archive in sorted((repo / "docker_img_files").glob("*.tar")):
+        if archive.is_symlink():
+            raise KarsError("Image archives must not be symlinks")
+        info = archive.stat()
+        stamp = [info.st_size, info.st_mtime_ns]
+        known = seen.get(archive.name) if isinstance(seen, dict) else None
+        try:
+            present = known["stamp"] == stamp and bool(known["images"]) and all(
+                isinstance(digest, str) and digest and image_id(docker, reference) == digest
+                for reference, digest in known["images"].items())
+        except (KeyError, TypeError, AttributeError):
+            present = False
+        if present:
+            print(f"Image archive unchanged and still loaded, skipped: {archive.name}", flush=True)
+            current[archive.name] = known
+            continue
+        print(f"Loading image archive: {archive.name}", flush=True)
+        output = checked_run([docker, "load", "--input", str(archive)],
+                             step=f"docker load ({archive.name})").stdout.decode("utf-8", "replace")
+        images = {reference: image_id(docker, reference)
+                  for reference in re.findall(r"^Loaded image(?: ID)?: (\S+)\s*$", output, re.M)}
+        if images and all(images.values()):
+            current[archive.name] = {"stamp": stamp, "images": images}
+    if current != seen:
+        private_write(record, json.dumps(current, indent=2) + "\n")
+
+
+def verify_project(root, instance, project):
+    """Raise unless a manifest entry still names an unmodified config in the data root."""
+    relative = Path(project["file"])
+    if project["bundle"] not in BUNDLES or project["project"] != f"kars-{instance}-{project['bundle']}":
+        raise ValueError()
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts[0].startswith("config-"):
+        raise ValueError()
+    config = root / relative
+    if not config.resolve().is_relative_to(root.resolve()) or config.is_symlink():
+        raise ValueError()
+    if hashlib.sha256(config.read_bytes()).hexdigest() != project["sha256"]:
+        raise ValueError()
+
+
+def load_record(root):
+    """Project entries of deployment.json as written, unverified; empty if unreadable."""
+    try:
+        projects = json.loads((root / "deployment.json").read_text(encoding="utf-8"))["projects"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return projects if isinstance(projects, list) else []
+
+
+def retained_projects(root, manifest):
+    """Recorded projects whose bundle has no template in this run.
+
+    They are not restarted, but they stay in the record: dropping them would
+    leave their containers running where cleanup can no longer reach them.
+    """
+    current = {project["bundle"] for project in manifest["projects"]}
+    retained = []
+    for project in load_record(root):
+        try:
+            if project["bundle"] not in current:
+                verify_project(root, manifest["instance"], project)
+                retained.append(project)
+        except (ValueError, KeyError, TypeError, IndexError, OSError):
+            continue
+    return retained
 
 
 def deploy(docker, repo, root, manifest):
-    checked_run([docker, "info"])
+    """Start the prepared generation. Returns the projects retained_projects kept."""
+    checked_run([docker, "info"], step="docker info", hint=DAEMON_HINT)
     validate_configs(docker, root, manifest)
     # Known persistent directories only; never invent directories for missing
     # file mounts. Docker's create_host_path=false provides the final guard.
@@ -401,18 +568,23 @@ def deploy(docker, repo, root, manifest):
         if directory.is_symlink():
             raise KarsError("Persistent data path is a symlink")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for image in sorted((repo / "docker_img_files").glob("*.tar")):
-        if image.is_symlink():
-            raise KarsError("Image archives must not be symlinks")
-        checked_run([docker, "load", "--input", str(image)])
+    missing = missing_bind_sources(root, manifest)
+    if missing:
+        raise KarsError("Bind mount sources do not exist, and Kars does not invent them: " + "; ".join(missing))
+    load_images(docker, repo, root)
     for network in manifest["networks"]:
         found = subprocess.run([docker, "network", "inspect", network], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if found.returncode:
-            checked_run([docker, "network", "create", network])
+            checked_run([docker, "network", "create", network], step=f"docker network create {network}")
+    retained = retained_projects(root, manifest)
     # Keep the manifest if a later up fails: cleanup can stop partial deployments.
-    private_write(root / "deployment.json", json.dumps(manifest, indent=2) + "\n")
+    record = dict(manifest, projects=manifest["projects"] + retained)
+    private_write(root / "deployment.json", json.dumps(record, indent=2) + "\n")
     for project in manifest["projects"]:
-        checked_run(compose_command(docker, root, project) + ["up", "-d", "--pull", "never", "--no-build"])
+        print(f"Starting {project['bundle']}", flush=True)
+        checked_run(compose_command(docker, root, project) + ["up", "-d", "--pull", "never", "--no-build"],
+                    step=f"docker compose up ({project['bundle']})")
+    return retained
 
 
 def load_manifest(root):
@@ -420,35 +592,89 @@ def load_manifest(root):
     if path.is_symlink() or not path.is_file():
         raise KarsError("No managed deployment manifest")
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         if data["schema"] != 1 or not re.fullmatch(r"[a-f0-9]{12}", data["instance"]):
             raise ValueError()
         for project in data["projects"]:
-            relative = Path(project["file"])
-            if project["bundle"] not in BUNDLES or project["project"] != f"kars-{data['instance']}-{project['bundle']}":
-                raise ValueError()
-            if relative.is_absolute() or ".." in relative.parts or not relative.parts[0].startswith("config-"):
-                raise ValueError()
-            config = root / relative
-            if not config.resolve().is_relative_to(root.resolve()) or config.is_symlink():
-                raise ValueError()
-            if hashlib.sha256(config.read_bytes()).hexdigest() != project["sha256"]:
-                raise ValueError()
+            verify_project(root, data["instance"], project)
         return data
     except (ValueError, KeyError, TypeError, IndexError, OSError):
         raise KarsError("Deployment manifest/config was changed or damaged; refusing unscoped cleanup")
 
 
+def recorded_generations(root, name):
+    """Generation directories a record names; None if it exists but cannot be read."""
+    record = root / name
+    if not record.exists():
+        return set()
+    try:
+        projects = json.loads(record.read_text(encoding="utf-8"))["projects"]
+        return {Path(project["file"]).parts[0] for project in projects}
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def prune_generations(root, only=None):
+    """Remove rendered configurations that no record refers to any more.
+
+    Each one holds a copy of the credentials. After a deployment every
+    recorded project runs from a recorded generation, so the rest are unused.
+    A run that starts nothing cannot know that and passes `only`, the
+    generations it superseded itself. An unreadable record protects everything.
+    """
+    referenced = set()
+    for name in ("deployment.json", "prepared.json"):
+        named = recorded_generations(root, name)
+        if named is None:
+            return
+        referenced |= named
+    for path in root.glob("config-*"):
+        if only is not None and path.name not in only:
+            continue
+        if (re.fullmatch(r"config-[0-9a-f]{32}", path.name) and path.name not in referenced
+                and path.is_dir() and not path.is_symlink()):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def compose_rows(output):
+    """`compose ps --format json` prints one array or one object per line, depending on the release."""
+    try:
+        values = [json.loads(output)]
+    except ValueError:
+        values = []
+        for line in output.splitlines():
+            try:
+                values.append(json.loads(line))
+            except ValueError:
+                continue
+    rows = []
+    for value in values:
+        rows.extend(value if isinstance(value, list) else [value])
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def status(docker, root, manifest):
+    print(f"Instance {manifest['instance']}, data root {root}")
+    for project in manifest["projects"]:
+        output = checked_run(compose_command(docker, root, project) + ["ps", "--all", "--format", "json"],
+                             step=f"docker compose ps ({project['bundle']})").stdout.decode("utf-8", "replace")
+        rows = compose_rows(output)
+        print(f"{project['bundle']}:" + ("" if rows else " no containers"))
+        for row in rows:
+            print(f"  {row.get('Service', '?')}: {row.get('State', '?')} ({row.get('Status', '?')})")
+
+
 def cleanup(docker, root, manifest):
     for project in manifest["projects"]:
-        checked_run(compose_command(docker, root, project) + ["down"])
+        checked_run(compose_command(docker, root, project) + ["down"],
+                    step=f"docker compose down ({project['bundle']})")
     # No global prune, force removal, image deletion, external-network removal,
     # volume deletion or credential/data deletion.
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("check", "prepare", "deploy", "cleanup"), default="deploy")
+    parser.add_argument("action", nargs="?", choices=ACTIONS, default="deploy")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--data-root", type=Path, default=Path.home() / ".kars")
     parser.add_argument("--yes", action="store_true", help="Confirm stopping this managed deployment only")
@@ -458,6 +684,9 @@ def main(argv=None):
     try:
         if os.environ.get("SUDO_USER"):
             raise KarsError("Run as the deployment user, not through sudo; Docker access must already be configured")
+        if args.action == "status":
+            status(docker_command(), root, load_manifest(root))
+            return 0
         if args.action == "cleanup":
             manifest = load_manifest(root)
             if not args.yes:
@@ -468,26 +697,50 @@ def main(argv=None):
             return 0
         documents = inputs(repo)
         if args.action == "check":
-            print(f"Input syntax accepted for {len(documents)} bundle(s); no files or containers changed.")
+            print(f"Input syntax accepted for {len(documents)} bundle(s): {', '.join(documents)}; no files or containers changed.")
+            absent = [bundle for bundle in BUNDLES if bundle not in documents]
+            if absent:
+                print(f"Not supplied: {', '.join(absent)}.")
+            ignored = sorted(p.name for p in (repo / "docker_compose_files").iterdir()
+                             if p.is_dir() and p.name not in BUNDLES)
+            if ignored:
+                print(f"Ignored, not a Kars bundle name: {', '.join(ignored)}.")
             return 0
         docker = docker_command() if args.action == "deploy" else None
         if docker:
-            checked_run([docker, "info"])
+            checked_run([docker, "info"], step="docker info", hint=DAEMON_HINT)
+        retained = []
         with deployment_lock(root):
             creds = credentials(root)
             manifest = prepare(repo, root, documents, creds)
             if docker:
-                deploy(docker, repo, root, manifest)
+                try:
+                    retained = deploy(docker, repo, root, manifest)
+                except BaseException:
+                    # Stopped before anything was recorded: nothing runs from
+                    # this generation, so do not leave its credentials around.
+                    if manifest["projects"][0] not in load_record(root):
+                        shutil.rmtree(root / Path(manifest["projects"][0]["file"]).parts[0], ignore_errors=True)
+                    raise
+                prune_generations(root)
             else:
+                superseded = recorded_generations(root, "prepared.json") or set()
                 private_write(root / "prepared.json", json.dumps(manifest, indent=2) + "\n")
+                prune_generations(root, only=superseded)
         if docker:
             print("Compose up completed for every bundle. Application login, readiness and hardware behavior remain to be verified.")
+            if retained:
+                print("Still recorded from an earlier run, not restarted (no template now): "
+                      + ", ".join(project["bundle"] for project in retained) + ". cleanup --yes stops these too.")
         else:
             print("Configuration prepared; Docker validation/deployment not performed. Credentials are private and reused on rerun.")
         return 0
     except (KarsError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("ERROR: Interrupted; no success reported. status shows what is recorded, cleanup --yes stops it.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
