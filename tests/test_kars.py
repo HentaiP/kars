@@ -438,6 +438,18 @@ class FakeDockerTests(Fixture):
         self.assertEqual(len(self.calls(" down")), 2)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows launcher")
+class WindowsLauncherTests(Fixture):
+    def test_batch_launcher_reaches_kars(self):
+        ran = subprocess.run(["cmd.exe", "/d", "/c", str(ROOT / "run_windows.bat"), "check",
+                              "--repo", str(self.repo), "--data-root", str(self.data)],
+                             env=dict(os.environ, KARS_PYTHON=sys.executable),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertIn("Input syntax accepted for 2 bundle(s)", ran.stdout)
+        self.assertNotIn("is not recognized", ran.stdout + ran.stderr)
+
+
 @POSIX
 class ShellBoundaryTests(unittest.TestCase):
     def test_backup_never_puts_password_on_command_line_and_restore_defaults_to_plan(self):
