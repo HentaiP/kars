@@ -38,7 +38,7 @@ Kars_EV_Ultimate/
 ### Windows
 - Install Python 3.10+ and Docker Desktop with Compose v2; start Docker first.
 - In PowerShell: `py -3 -m venv .venv`, then `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
-- Run `.\.venv\Scripts\python.exe kars.py check`, then use `deploy`; alternatively set `KARS_PYTHON` to that interpreter before using the launcher.
+- Run `.\.venv\Scripts\python.exe kars.py check`, then use `deploy`; `run_windows.bat` uses that `.venv` by itself.
 
 ### macOS / Linux
 - **Notice**: Ensure the project directory path contains **ONLY English characters** to prevent mount failures.
@@ -61,7 +61,8 @@ python -m pip install -r requirements.txt
 ## Scope and validation
 
 - Supply legally obtained Compose templates and images matching the expected layout; an empty checkout cannot deploy a service.
-- `python kars.py check` checks input syntax only; `prepare` writes configuration without starting containers; `deploy` runs Compose.
+- `python kars.py check` checks input syntax only; `prepare` writes configuration without starting containers; `deploy` runs Compose; `status` lists the recorded projects and their containers.
+- Reruns skip image archives that are already loaded and remove configurations nothing uses any more.
 - Data and credentials default to `~/.kars`. Back them up privately; never commit them.
 - Successful Compose startup does not establish application login, readiness, or hardware compatibility. The ARM64 check does not install emulation or guarantee x86 image compatibility.
 - `cleanup --yes` stops only recorded Compose projects and retains data, credentials and images; it is not a system-wide purge.

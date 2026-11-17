@@ -38,7 +38,7 @@ Kars_EV_Ultimate/
 ### Windows
 - 先安裝 Python 3.10+、Docker Desktop（含 Compose v2），並啟動 Docker。
 - PowerShell：`py -3 -m venv .venv`，再執行 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`。
-- 執行 `.\.venv\Scripts\python.exe kars.py check` 檢查輸入，再以 `deploy` 部署；也可將 `KARS_PYTHON` 指向該 Python 後使用啟動器。
+- 執行 `.\.venv\Scripts\python.exe kars.py check` 檢查輸入，再以 `deploy` 部署；`run_windows.bat` 會自動使用這個 `.venv`。
 
 ### macOS / Linux
 - **注意**：請確保專案目錄路徑為 **全英文**，以避免掛載失敗。
@@ -61,7 +61,8 @@ python -m pip install -r requirements.txt
 ## 使用範圍與驗證
 
 - 請自行提供合法取得、符合程式預期的 Compose 範本與映像；空白 checkout 不能直接部署。
-- `python kars.py check` 只檢查輸入語法；`prepare` 寫入設定但不啟動容器；`deploy` 執行 Compose。
+- `python kars.py check` 只檢查輸入語法；`prepare` 寫入設定但不啟動容器；`deploy` 執行 Compose；`status` 列出記錄中的專案與容器狀態。
+- 重跑時會略過已載入的映像檔，並移除不再使用的舊設定。
 - 預設資料與憑證存於 `~/.kars`，請私下備份，不要提交至 Git。
 - Compose 啟動成功不代表登入、服務就緒或硬體行為已驗收。ARM64 檢查不提供模擬器，也不保證 x86 映像相容。
 - `cleanup --yes` 只停止記錄中的 Compose 專案，保留資料、憑證與映像；不是全機清除工具。
