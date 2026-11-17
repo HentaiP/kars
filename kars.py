@@ -452,19 +452,26 @@ def compose_command(docker, root, project):
 
 
 def validate_configs(docker, root, manifest):
+    """Have Compose accept every rendered file; returns the services it would start, per bundle."""
+    active = {}
     for project in manifest["projects"]:
-        checked_run(compose_command(docker, root, project) + ["config", "--quiet"],
-                    step=f"docker compose config ({project['bundle']})")
+        listed = checked_run(compose_command(docker, root, project) + ["config", "--services"],
+                             step=f"docker compose config ({project['bundle']})")
+        active[project["bundle"]] = set(listed.stdout.decode("utf-8", "replace").split())
+    return active
 
 
-def missing_bind_sources(root, manifest):
+def missing_bind_sources(root, manifest, active):
     """Bind sources that do not exist. create_host_path=false makes Compose
-    refuse them anyway; this names them, which Compose's withheld output cannot."""
+    refuse them anyway; this names them, which Compose's withheld output cannot.
+    Services Compose would not start (an inactive profile) are left alone."""
     missing = []
     for project in manifest["projects"]:
         compose = root / project["file"]
         document = yaml.safe_load(compose.read_text(encoding="utf-8"))
-        for service in document["services"].values():
+        for name, service in document["services"].items():
+            if name not in active.get(project["bundle"], ()):
+                continue
             for volume in service.get("volumes") or []:
                 if not isinstance(volume, dict) or volume.get("type") != "bind":
                     continue
@@ -564,7 +571,7 @@ def retained_projects(root, manifest):
 def deploy(docker, repo, root, manifest):
     """Start the prepared generation. Returns the projects retained_projects kept."""
     checked_run([docker, "info"], step="docker info", hint=DAEMON_HINT)
-    validate_configs(docker, root, manifest)
+    active = validate_configs(docker, root, manifest)
     # Known persistent directories only; never invent directories for missing
     # file mounts. Docker's create_host_path=false provides the final guard.
     for path in ("kars/data/mysql", "kars/data/mongodb", "kars/data/logs",
@@ -573,7 +580,7 @@ def deploy(docker, repo, root, manifest):
         if directory.is_symlink():
             raise KarsError("Persistent data path is a symlink")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    missing = missing_bind_sources(root, manifest)
+    missing = missing_bind_sources(root, manifest, active)
     if missing:
         raise KarsError("Bind mount sources do not exist, and Kars does not invent them: " + "; ".join(missing))
     load_images(docker, repo, root)
@@ -619,15 +626,35 @@ def recorded_generations(root, name):
         return None
 
 
-def prune_generations(root, only=None):
-    """Remove rendered configurations that no record refers to any more.
+def mounted_generations(docker):
+    """Generations some container still mounts from; None if Docker cannot say.
 
-    Each one holds a copy of the credentials. After a deployment every
-    recorded project runs from a recorded generation, so the rest are unused.
-    A run that starts nothing cannot know that and passes `only`, the
+    Compose leaves the container of a service that was dropped from a template
+    running, still mounted from the generation that started it.
+    """
+    listed = subprocess.run([docker, "ps", "--all", "--quiet", "--no-trunc"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if listed.returncode:
+        return None
+    containers = listed.stdout.decode("ascii", "replace").split()
+    if not containers:
+        return set()
+    mounts = subprocess.run([docker, "inspect", "--format", "{{range .Mounts}}{{println .Source}}{{end}}", *containers],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if mounts.returncode:
+        return None
+    # By name, not by path: Docker Desktop reports host paths in its own form.
+    return set(re.findall(r"config-[0-9a-f]{32}", mounts.stdout.decode("utf-8", "replace")))
+
+
+def prune_generations(root, only=None, in_use=()):
+    """Remove rendered configurations that nothing refers to any more.
+
+    Each one holds a copy of the credentials. A deployment passes `in_use`,
+    what containers still mount. A run that starts nothing passes `only`, the
     generations it superseded itself. An unreadable record protects everything.
     """
-    referenced = set()
+    referenced = set(in_use)
     for name in ("deployment.json", "prepared.json"):
         named = recorded_generations(root, name)
         if named is None:
@@ -671,7 +698,9 @@ def status(docker, root, manifest):
 
 def cleanup(docker, root, manifest):
     for project in manifest["projects"]:
-        checked_run(compose_command(docker, root, project) + ["down"],
+        # --remove-orphans stays inside the project: it takes the containers
+        # of services that a later template no longer defines.
+        checked_run(compose_command(docker, root, project) + ["down", "--remove-orphans"],
                     step=f"docker compose down ({project['bundle']})")
     # No global prune, force removal, image deletion, external-network removal,
     # volume deletion or credential/data deletion.
@@ -727,7 +756,9 @@ def main(argv=None):
                     if manifest["projects"][0] not in load_record(root):
                         shutil.rmtree(root / Path(manifest["projects"][0]["file"]).parts[0], ignore_errors=True)
                     raise
-                prune_generations(root)
+                in_use = mounted_generations(docker)
+                if in_use is not None:
+                    prune_generations(root, in_use=in_use)
             else:
                 superseded = recorded_generations(root, "prepared.json") or set()
                 private_write(root / "prepared.json", json.dumps(manifest, indent=2) + "\n")

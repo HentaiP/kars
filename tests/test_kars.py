@@ -35,6 +35,9 @@ FAKE_DOCKER = """
         "load --input "*) echo "Loaded image: demo/app:1" ;;
         "image inspect "*) [ -f "$KARS_FAKE/image-gone" ] && exit 1; echo "sha256:feed" ;;
         "network inspect "*) exit 1 ;;
+        *" config --services") printf 'kars-gateway\\nkars-core\\n' ;;
+        "ps --all --quiet --no-trunc") [ -f "$KARS_FAKE/mounts" ] && echo c0ffee ;;
+        "inspect --format "*) /bin/cat "$KARS_FAKE/mounts" ;;
         *" ps --all --format json") echo '{"Service":"app","State":"running","Status":"Up 1 second"}' ;;
         *" up -d "*) [ -f "$KARS_FAKE/up-fails" ] && { echo "TOP-SECRET-OUTPUT" >&2; exit 7; } ;;
     esac
@@ -359,6 +362,33 @@ class FakeDockerTests(Fixture):
         self.assertEqual(self.run_main("deploy")[0], 0)
         self.assertFalse(unrecorded.exists())
         self.assertEqual(len(self.generations()), 2)        # deployed, and the last prepared
+
+    def test_generation_a_container_still_mounts_is_kept(self):
+        self.assertEqual(self.run_main("deploy")[0], 0)
+        first = self.generations()[0]
+        # A service dropped from its template: Compose leaves its container running.
+        write(self.fake / "mounts", f"/host_mnt{self.data}/{first}/nginx\n")
+        self.assertEqual(self.run_main("deploy")[0], 0)
+        self.assertIn(first, self.generations())
+        self.assertEqual(len(self.generations()), 2)
+        (self.fake / "mounts").unlink()
+        self.assertEqual(self.run_main("deploy")[0], 0)
+        self.assertNotIn(first, self.generations())
+        self.assertEqual(len(self.generations()), 1)
+        self.assertEqual(self.run_main("cleanup", "--yes")[0], 0)
+        self.assertTrue(all(call.endswith(" down --remove-orphans") for call in self.calls(" down")))
+
+    def test_inactive_profile_service_is_not_preflighted(self):
+        path = self.repo / "docker_compose_files/kars-core/docker-compose.yml"
+        path.write_text(path.read_text() + (
+            "  tools:\n"
+            "    image: example.invalid/tools:test\n"
+            "    profiles: [tools]\n"
+            "    volumes:\n"
+            "      - ~/.kars/kars-core/absent.pem:/absent.pem\n"))
+        self.assertIn("tools", kars.inputs(self.repo)["kars-core"]["services"])
+        code, _, err = self.run_main("deploy")       # the stand-in lists kars-gateway and kars-core as active
+        self.assertEqual(code, 0, err)
 
     def test_failed_step_is_named_and_native_output_withheld(self):
         (self.fake / "up-fails").touch()
